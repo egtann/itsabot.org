@@ -86,6 +86,14 @@ func main() {
 	router.HandlerFunc("DELETE", "/api/plugins.json", handlerAPIPluginsDelete)
 	router.Handle("GET", "/api/weather/:city", handlerAPIWeatherSearch)
 
+	// Training routes
+	router.Handle("GET", "/api/plugins/train/:pluginName", handlerAPIPluginsTrainings)
+	router.HandlerFunc("POST", "/api/plugins/train.json", handlerAPIPluginsTrain)
+	router.HandlerFunc("PUT", "/api/plugins/train.json", handlerAPIPluginsTrainUpdate)
+	router.HandlerFunc("DELETE", "/api/plugins/train.json", handlerAPIPluginsTrainDelete)
+	router.HandlerFunc("OPTIONS", "/api/plugins/train/:pluginName", handlerOptionsTrainings)
+	router.HandlerFunc("OPTIONS", "/api/plugins/train.json", handlerOptionsTrain)
+
 	// Create a worker pool to process and test plugins
 	pool, err = tunny.CreatePool(runtime.NumCPU(), func(object interface{}) interface{} {
 		var compileOK, testOK, vetOK bool
@@ -240,6 +248,7 @@ func main() {
 		}
 	}()
 
+	log.Info("booted server")
 	if len(os.Getenv("ITSABOT_PORT")) > 0 {
 		err = http.ListenAndServe(":"+os.Getenv("ITSABOT_PORT"), router)
 	} else {
@@ -273,6 +282,20 @@ func handlerIndex(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+}
+
+func handlerOptionsTrainings(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Methods", "GET")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Access-Control-Allow-Origin")
+	w.WriteHeader(http.StatusOK)
+}
+
+func handlerOptionsTrain(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Methods", "POST,PUT,DELETE")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Access-Control-Allow-Origin")
+	w.WriteHeader(http.StatusOK)
 }
 
 func handlerAPIPluginsIncrementCount(w http.ResponseWriter, r *http.Request) {
@@ -484,6 +507,167 @@ func handlerAPIPluginsDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Info("deleted plugin", req.PluginID)
+	w.WriteHeader(http.StatusOK)
+}
+
+// handlerAPIPluginsTrainings retrieves trained sentences and properties for a
+// given plugin.
+func handlerAPIPluginsTrainings(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Access-Control-Allow-Origin")
+	p, err := url.QueryUnescape(ps.ByName("pluginName"))
+	if err != nil {
+		writeErrorBadRequest(w, err)
+		return
+	}
+
+	// Get plugin ID from name
+	//
+	// TODO the client should pass the plugin ID in its initial request,
+	// eliminating the need for this double-lookup.
+	var id uint64
+	q := `SELECT id FROM plugins WHERE name=$1`
+	err = db.Get(&id, q, p)
+	if err == sql.ErrNoRows {
+		writeErrorBadRequest(w, errors.New("plugin not published"))
+		return
+	}
+	if err != nil {
+		writeErrorInternal(w, err)
+		return
+	}
+
+	// Get plugin from ID
+	var sentences []struct {
+		ID       uint64
+		Sentence string
+		Intent   *string
+	}
+	q = `SELECT id, sentence, intent FROM trainings
+	     WHERE pluginid=$1
+	     ORDER BY createdat DESC`
+	err = db.Select(&sentences, q, id)
+	if err != nil && err != sql.ErrNoRows {
+		writeErrorInternal(w, err)
+		return
+	}
+
+	b, err := json.Marshal(sentences)
+	if err != nil {
+		writeErrorInternal(w, err)
+		return
+	}
+	_, err = w.Write(b)
+	if err != nil {
+		log.Info("failed to write response.", err)
+	}
+}
+
+// handlerAPIPluginsTrain trains a plugin on a new sentence or updates the
+// intent of an existing sentence.
+func handlerAPIPluginsTrain(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Access-Control-Allow-Origin")
+	var req struct {
+		PluginName string
+		Sentence   string
+		Intent     string
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErrorBadRequest(w, err)
+		return
+	}
+	if len(req.PluginName) == 0 {
+		writeErrorBadRequest(w, errors.New("PluginID must be greater than 0"))
+		return
+	}
+	if len(req.Intent) == 0 {
+		writeErrorBadRequest(w, errors.New("Intent cannot be blank"))
+		return
+	}
+	if len(req.Sentence) == 0 {
+		writeErrorBadRequest(w, errors.New("Sentence cannot be blank"))
+		return
+	}
+
+	// Get plugin ID from name
+	//
+	// TODO the client should pass the plugin ID in its initial request,
+	// eliminating the need for this double-lookup.
+	var id uint64
+	q := `SELECT id FROM plugins WHERE name=$1`
+	err := db.Get(&id, q, req.PluginName)
+	if err == sql.ErrNoRows {
+		writeErrorBadRequest(w, errors.New("plugin not published"))
+		return
+	}
+	if err != nil {
+		writeErrorInternal(w, err)
+		return
+	}
+
+	q = `INSERT INTO trainings (sentence, intent, pluginid)
+	     VALUES ($1, $2, $3)
+	     ON CONFLICT (sentence, pluginid) DO UPDATE SET intent=$1`
+	_, err = db.Exec(q, req.Sentence, req.Intent, id)
+	if err != nil {
+		writeErrorInternal(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// handlerAPIPluginsTrainUpdate updates a list of plugins.
+func handlerAPIPluginsTrainUpdate(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Access-Control-Allow-Origin")
+	var req []struct {
+		ID     uint64
+		Intent string
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErrorBadRequest(w, err)
+		return
+	}
+	tx, err := db.Beginx()
+	if err != nil {
+		writeErrorInternal(w, err)
+		return
+	}
+	var q string
+	for _, s := range req {
+		q = `UPDATE trainings SET intent=$1 WHERE id=$2`
+		_, err = tx.Exec(q, s.Intent, s.ID)
+		if err != nil {
+			writeErrorInternal(w, err)
+			return
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		writeErrorInternal(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// handlerAPIPluginsTrainDelete deletes a trained sentence from a plugin.
+func handlerAPIPluginsTrainDelete(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Access-Control-Allow-Origin")
+	var req struct {
+		Sentence string
+		PluginID uint64
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErrorBadRequest(w, err)
+		return
+	}
+	q := `DELETE FROM trainings WHERE pluginid=$1 AND sentence=$2`
+	_, err := db.Exec(q, req.PluginID, req.Sentence)
+	if err != nil {
+		writeErrorInternal(w, err)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
