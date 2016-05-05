@@ -2230,6 +2230,20 @@ abot.request = function(opts) {
 	}
 	return m.request(opts)
 }
+// prettyTime is from http://stackoverflow.com/a/7641822
+abot.prettyTime = function(time) {
+	var date = new Date((time || "").replace(/-/g, "/").replace(/[TZ]/g, " ")),
+        diff = (((new Date()).getTime() - date.getTime()) / 1000),
+        day_diff = Math.floor(diff / 86400)
+    if (isNaN(day_diff) || day_diff < 0 || day_diff >= 31) return
+	return day_diff == 0 && (
+		diff < 60 && "just now" || diff < 120 && "1 minute ago" ||
+		diff < 3600 && Math.floor(diff / 60) + " minutes ago" || diff < 7200 &&
+		"1 hour ago" || diff < 86400 && Math.floor(diff / 3600) + " hours ago"
+	) || day_diff == 1 && "Yesterday" || day_diff < 7 &&
+	day_diff + " days ago" || day_diff < 31 &&
+	Math.ceil(day_diff / 7) + " weeks ago"
+}
 abot.signout = function(ev) {
 	ev.preventDefault()
 	abot.request({
@@ -2694,7 +2708,7 @@ abot.Profile = {}
 abot.Profile.controller = function() {
 	abot.Login.checkAuth(function(loggedIn) {
 		if (!loggedIn) {
-			return m.route("/login")
+			return m.route("/login", null, true)
 		}
 	})
 	var ctrl = this
@@ -2704,41 +2718,36 @@ abot.Profile.controller = function() {
 			url: "/api/user.json",
 		})
 	}
-	ctrl.showSuccess = function() {
-		var sEl = document.getElementById("success")
-		if (sEl != null && abot.successFlash().length > 0) {
-			sEl.classList.remove("hidden")
-		}
-	}
-	ctrl.hideSuccess = function() {
-		var sEl = document.getElementById("success")
-		if (sEl != null) {
-			sEl.classList.add("hidden")
-		}
-		abot.successFlash("")
-	}
-	ctrl.error = m.prop("")
-	ctrl.hideError = function() {
-		ctrl.error("")
-		var errEl = document.getElementById("err")
-		if (errEl != null) {
-			errEl.classList.add("hidden")
-		}
-	}
-	ctrl.showError = function(err) {
-		ctrl.error(err)
-		var errEl = document.getElementById("err")
-		if (errEl != null) {
-			errEl.classList.remove("hidden")
-		}
+	ctrl.generateToken = function(ev) {
+		ev.preventDefault()
+		abot.request({
+			method: "POST",
+			url: "/api/users/auth_token.json",
+		}).then(function(resp) {
+			ctrl.props.tokens().unshift(resp)
+			ctrl.props.errorToken("")
+			ctrl.props.successToken("Success! Generated token.")
+		}, function(err) {
+			ctrl.props.successToken("")
+			ctrl.props.errorToken("Error! Failed to generate token. " + err.Msg)
+		})
 	}
 	ctrl.props = {
 		results: m.prop([]),
+		tokens: m.prop([]),
+
+		// Success and error blocks related to plugins
+		success: m.prop(""),
+		error: m.prop(""),
+
+		// Success and error blocks related to tokens
+		successToken: m.prop(""),
+		errorToken: m.prop(""),
 	}
 	var interval
 	ctrl.refresh = function() {
 		ctrl.data().then(function(data) {
-			if (abot.successFlash().length > 0) {
+			if (ctrl.props.success().length > 0) {
 				if (interval == null) {
 					console.log("scheduling refresh")
 					interval = setInterval(ctrl.refresh, 1500)
@@ -2747,12 +2756,11 @@ abot.Profile.controller = function() {
 					clearInterval(interval)
 				}
 			}
-			ctrl.hideError()
-			if (data != null) {
-				ctrl.props.results(data)
-			}
+			ctrl.props.error("")
+			ctrl.props.results(data.Plugins || [])
+			ctrl.props.tokens(data.Tokens || [])
 		}, function(err) {
-			ctrl.showError(err)
+			ctrl.props.error(err.Msg)
 		})
 	}
 	ctrl.refresh()
@@ -2763,19 +2771,102 @@ abot.Profile.view = function(ctrl) {
 		m(".main", [
 			m(".content", [
 				m("h1", "Profile - " + cookie.getItem("email")),
-				m("#err", { class: "alert alert-error hidden" }, ctrl.error()),
+				function() {
+					if (ctrl.props.error().length > 0) {
+						return m("#err.alert.alert-error", ctrl.props.error())
+					} else if (ctrl.props.success().length > 0) {
+						return m("#success.alert.alert-success", ctrl.props.success())
+					}
+				}(),
 				m("h2", "Your plugins"),
-				m("#success", {
-					class: "alert alert-success hidden",
-					config: ctrl.showSuccess,
-				}, abot.successFlash()),
 				m.component(abot.SearchResult, ctrl),
 				m("a[href=/plugins/new].btn.btn-styled", {
 					config: m.route,
 				}, "+ Add plugin"),
+				m("h2", "Auth tokens"),
+				function() {
+					if (ctrl.props.errorToken().length > 0) {
+						return m("#err.alert.alert-error", ctrl.props.errorToken())
+					} else if (ctrl.props.successToken().length > 0) {
+						return m("#success.alert.alert-success", ctrl.props.successToken())
+					}
+				}(),
+				m("p", "Auth tokens enable you to modify your plugins via external services. Only give your auth tokens to services you trust."),
+				m("p", "You should use a unique token to authenticate into each external service."),
+				function() {
+					if (ctrl.props.tokens().length === 0) {
+						return
+					}
+					return m("table", [
+						m("thead", [
+							m("tr", [
+								m("td", ""),
+								m("td", "Token"),
+								m("td.hidden-small", "Created"),
+							]),
+						]),
+						m("tbody", [
+							function() {
+								var els = []
+								var t = ctrl.props.tokens()
+								for (var i = 0; i <	t.length; i++) {
+									var c = m.component(abot.TableItemToken, ctrl, t[i])
+									els.push(c)
+								}
+								return els
+							}(),
+						]),
+					])
+				}(),
+				m("input.btn[type=button]", {
+					value: "Generate Auth Token",
+					onclick: ctrl.generateToken,
+				}),
 			]),
 		]),
 		m.component(abot.Footer),
+	])
+}
+})(!window.abot ? window.abot={} : window.abot);
+(function(abot) {
+abot.Searchbar = {}
+abot.Searchbar.controller = function(pctrl) {
+	var ctrl = this
+	ctrl.focus = function(el) {
+		el.focus()
+	}
+	ctrl.search = function(ev) {
+		ev.preventDefault()
+		var input = ev.target.children[0]
+		if (input.value.length === 0) {
+			document.getElementById("plugins-start").classList.remove("hidden")
+			document.getElementById("search-results").classList.add("hidden")
+			return
+		}
+		m.request({
+			method: "GET",
+			url: "/api/plugins/search/" + encodeURI(input.value),
+		}).then(function(res) {
+			document.getElementById("search-results").classList.remove("hidden")
+			document.getElementById("plugins-start").classList.add("hidden")
+			res = res || []
+			pctrl.props.results(res)
+		}, function(err) {
+			console.error(err)
+		})
+	}
+}
+abot.Searchbar.view = function(ctrl) {
+	return m(".searchbar", [
+		m(".main", [
+			m("form", { onsubmit: ctrl.search }, [
+				m("input[type=text]#searchbar-input", {
+					placeholder: "Find plugins",
+					config: ctrl.focus,
+				}),
+				m("button[type=submit]", m(".search", m.trust("&#9906;"))),
+			])
+		]),
 	])
 }
 })(!window.abot ? window.abot={} : window.abot);
@@ -2859,77 +2950,6 @@ abot.SearchResult.view = function(ctrl, pctrl) {
 			]),
 		])
 	}()
-}
-})(!window.abot ? window.abot={} : window.abot);
-
-/*
-m("table", [
-			function() {
-				if (pctrl.props.results().length === 0) {
-					return m("tr", {
-						style: "border-bottom: none;"
-					}, m("td", [
-						"No results found. If you don't see your plugin, you can ",
-						m("a[href=/plugins/new]", "add it here."),
-					]))
-				} else {
-					return pctrl.props.results().map(function(item) {
-						var url = "https://" + item.Name
-						return m("tr", [
-							m("td", [
-								m("a[href=" + url + "]", item.Name),
-								" " + item.Username,
-								m(".description", item.Description),
-							]),
-							m("td", [
-								m(".downloads", item.DownloadCount), 
-							]),
-						])
-					})
-				}
-			}()
-		]),
-		*/
-(function(abot) {
-abot.Searchbar = {}
-abot.Searchbar.controller = function(pctrl) {
-	var ctrl = this
-	ctrl.focus = function(el) {
-		el.focus()
-	}
-	ctrl.search = function(ev) {
-		ev.preventDefault()
-		var input = ev.target.children[0]
-		if (input.value.length === 0) {
-			document.getElementById("plugins-start").classList.remove("hidden")
-			document.getElementById("search-results").classList.add("hidden")
-			return
-		}
-		m.request({
-			method: "GET",
-			url: "/api/plugins/search/" + encodeURI(input.value),
-		}).then(function(res) {
-			document.getElementById("search-results").classList.remove("hidden")
-			document.getElementById("plugins-start").classList.add("hidden")
-			res = res || []
-			pctrl.props.results(res)
-		}, function(err) {
-			console.error(err)
-		})
-	}
-}
-abot.Searchbar.view = function(ctrl) {
-	return m(".searchbar", [
-		m(".main", [
-			m("form", { onsubmit: ctrl.search }, [
-				m("input[type=text]#searchbar-input", {
-					placeholder: "Find plugins",
-					config: ctrl.focus,
-				}),
-				m("button[type=submit]", m(".search", m.trust("&#9906;"))),
-			])
-		]),
-	])
 }
 })(!window.abot ? window.abot={} : window.abot);
 (function(abot) {
@@ -3025,6 +3045,37 @@ abot.Signup.view = function(ctrl) {
 				]),
 			]),
 		]),
+	])
+}
+})(!window.abot ? window.abot={} : window.abot);
+(function(abot) {
+abot.TableItemToken = {}
+abot.TableItemToken.controller = function(pctrl, args) {
+	var ctrl = this
+	ctrl.deleteToken = function() {
+		var c = confirm("Are you sure you want to delete this token?")
+		if (!c) {
+			ev.preventDefault()
+			return
+		}
+		// Remove the row from the table
+		this.parentNode.parentNode.remove()
+		abot.request({
+			url: "/api/users/auth_token.json",
+			method: "DELETE",
+			data: { Token: args.Token },
+		}).then(function() {
+			pctrl.props.successToken("Success! Deleted token.")
+		}, function(err) {
+			pctrl.props.errorToken("Error! Failed to delete token. Err: " + err.Msg)
+		})
+	}
+}
+abot.TableItemToken.view = function(ctrl, _, args) {
+	return m("tr", [
+		m("td", m("a[href=#/].btn-x", { onclick: ctrl.deleteToken }, "X")),
+		m("td", args.Token),
+		m("td.hidden-small", m("small", abot.prettyTime(args.CreatedAt))),
 	])
 }
 })(!window.abot ? window.abot={} : window.abot);

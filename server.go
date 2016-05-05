@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha512"
 	"database/sql"
 	"encoding/base64"
@@ -10,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
-	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -42,16 +42,28 @@ type Header struct {
 	IssuedAt int64
 }
 
+type Plugin struct {
+	ID            uint64
+	Name          sql.NullString
+	Path          string
+	Description   sql.NullString
+	DownloadCount uint64
+	CompileOK     bool
+	VetOK         bool
+	TestOK        bool
+	Error         sql.NullString
+	UpdatedAt     time.Time
+}
+
+type Token struct {
+	Token     string
+	CreatedAt time.Time
+}
+
 const apiURL = "https://api.github.com/"
 const apiWeatherURL = "http://api.openweathermap.org/data/2.5/weather?units=imperial&q="
-const securityTokenLength = 128
+const securityTokenLength = 48
 const bearerAuthKey = "Bearer"
-const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-const (
-	letterIdxBits = 6                    // 6 bits to represent a letter index
-	letterIdxMask = 1<<letterIdxBits - 1 // All 1-bits, as many as letterIdxBits
-	letterIdxMax  = 63 / letterIdxBits   // # of letter indices fitting in 63 bits
-)
 
 func main() {
 	var err error
@@ -77,6 +89,9 @@ func main() {
 	router.HandlerFunc("POST", "/api/users.json", handlerAPIUserCreate)
 	router.HandlerFunc("DELETE", "/api/users.json", handlerAPIUserExpireTokens)
 	router.HandlerFunc("POST", "/api/users/login.json", handlerAPIUserLoginSubmit)
+	router.HandlerFunc("GET", "/api/users/auth_tokens.json", handlerAPIAuthTokens)
+	router.HandlerFunc("POST", "/api/users/auth_token.json", handlerAPIAuthTokenGenerate)
+	router.HandlerFunc("DELETE", "/api/users/auth_token.json", handlerAPIAuthTokenDelete)
 
 	// Plugin routes
 	router.Handle("GET", "/api/plugins/search/:q", handlerAPIPluginsSearch)
@@ -87,12 +102,12 @@ func main() {
 	router.Handle("GET", "/api/weather/:city", handlerAPIWeatherSearch)
 
 	// Training routes
-	router.Handle("GET", "/api/plugins/train/:pluginName", handlerAPIPluginsTrainings)
+	router.Handle("GET", "/api/plugins/train/*pluginName", handlerAPIPluginsTrainings)
 	router.HandlerFunc("POST", "/api/plugins/train.json", handlerAPIPluginsTrain)
 	router.HandlerFunc("PUT", "/api/plugins/train.json", handlerAPIPluginsTrainUpdate)
 	router.HandlerFunc("DELETE", "/api/plugins/train.json", handlerAPIPluginsTrainDelete)
-	router.HandlerFunc("OPTIONS", "/api/plugins/train/:pluginName", handlerOptionsTrainings)
-	router.HandlerFunc("OPTIONS", "/api/plugins/train.json", handlerOptionsTrain)
+	router.HandlerFunc("OPTIONS", "/api/plugins/train/:pluginName", handlerAPIOptionsTrainings)
+	router.HandlerFunc("OPTIONS", "/api/plugins/train.json", handlerAPIOptionsTrain)
 
 	// Create a worker pool to process and test plugins
 	pool, err = tunny.CreatePool(runtime.NumCPU(), func(object interface{}) interface{} {
@@ -284,14 +299,14 @@ func handlerIndex(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func handlerOptionsTrainings(w http.ResponseWriter, r *http.Request) {
+func handlerAPIOptionsTrainings(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Methods", "GET")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Access-Control-Allow-Origin")
 	w.WriteHeader(http.StatusOK)
 }
 
-func handlerOptionsTrain(w http.ResponseWriter, r *http.Request) {
+func handlerAPIOptionsTrain(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Methods", "POST,PUT,DELETE")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Access-Control-Allow-Origin")
@@ -520,13 +535,18 @@ func handlerAPIPluginsTrainings(w http.ResponseWriter, r *http.Request, ps httpr
 		writeErrorBadRequest(w, err)
 		return
 	}
+	log.Info(p)
+	if len(p) > 0 {
+		// Remove leading '/'
+		p = p[1:]
+	}
 
-	// Get plugin ID from name
+	// Get plugin ID from name or path
 	//
 	// TODO the client should pass the plugin ID in its initial request,
 	// eliminating the need for this double-lookup.
 	var id uint64
-	q := `SELECT id FROM plugins WHERE name=$1`
+	q := `SELECT id FROM plugins WHERE name=$1 OR path=$1`
 	err = db.Get(&id, q, p)
 	if err == sql.ErrNoRows {
 		writeErrorBadRequest(w, errors.New("plugin not published"))
@@ -557,6 +577,7 @@ func handlerAPIPluginsTrainings(w http.ResponseWriter, r *http.Request, ps httpr
 		writeErrorInternal(w, err)
 		return
 	}
+	log.Info("RESPONSE", string(b))
 	_, err = w.Write(b)
 	if err != nil {
 		log.Info("failed to write response.", err)
@@ -566,12 +587,18 @@ func handlerAPIPluginsTrainings(w http.ResponseWriter, r *http.Request, ps httpr
 // handlerAPIPluginsTrain trains a plugin on a new sentence or updates the
 // intent of an existing sentence.
 func handlerAPIPluginsTrain(w http.ResponseWriter, r *http.Request) {
+	if os.Getenv("ABOT_ENV") != "test" {
+		if !authToken(w, r) {
+			return
+		}
+	}
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Access-Control-Allow-Origin")
 	var req struct {
 		PluginName string
 		Sentence   string
 		Intent     string
+		AuthTokens []string
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErrorBadRequest(w, err)
@@ -605,19 +632,43 @@ func handlerAPIPluginsTrain(w http.ResponseWriter, r *http.Request) {
 		writeErrorInternal(w, err)
 		return
 	}
+	if err := validateTokens(id, req.AuthTokens); err != nil {
+		writeErrorAuth(w, err)
+		return
+	}
 
 	q = `INSERT INTO trainings (sentence, intent, pluginid)
 	     VALUES ($1, $2, $3)
-	     ON CONFLICT (sentence, pluginid) DO UPDATE SET intent=$1`
-	_, err = db.Exec(q, req.Sentence, req.Intent, id)
+	     ON CONFLICT (sentence, pluginid) DO UPDATE SET intent=$1
+	     RETURNING id`
+	var trainingID uint64
+	err = db.QueryRow(q, req.Sentence, req.Intent, id).Scan(&trainingID)
 	if err != nil {
 		writeErrorInternal(w, err)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
+
+	resp := struct {
+		ID       uint64
+		Intent   string
+		Sentence string
+	}{
+		ID:       trainingID,
+		Intent:   req.Intent,
+		Sentence: req.Sentence,
+	}
+	byt, err := json.Marshal(resp)
+	if err != nil {
+		writeErrorInternal(w, err)
+		return
+	}
+	_, err = w.Write(byt)
+	if err != nil {
+		log.Info("failed to write response.", err)
+	}
 }
 
-// handlerAPIPluginsTrainUpdate updates a list of plugins.
+// handlerAPIPluginsTrainUpdate updates a plugin's training sentences.
 func handlerAPIPluginsTrainUpdate(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Access-Control-Allow-Origin")
@@ -629,13 +680,17 @@ func handlerAPIPluginsTrainUpdate(w http.ResponseWriter, r *http.Request) {
 		writeErrorBadRequest(w, err)
 		return
 	}
+	if err := validateTokens(req.PluginID, req.AuthTokens); err != nil {
+		writeErrorAuth(w, err)
+		return
+	}
 	tx, err := db.Beginx()
 	if err != nil {
 		writeErrorInternal(w, err)
 		return
 	}
 	var q string
-	for _, s := range req {
+	for _, s := range req.Sentences {
 		q = `UPDATE trainings SET intent=$1 WHERE id=$2`
 		_, err = tx.Exec(q, s.Intent, s.ID)
 		if err != nil {
@@ -655,11 +710,16 @@ func handlerAPIPluginsTrainDelete(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Access-Control-Allow-Origin")
 	var req struct {
-		Sentence string
-		PluginID uint64
+		Sentence   string
+		PluginID   uint64
+		AuthTokens []string
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErrorBadRequest(w, err)
+		return
+	}
+	if err := validateTokens(req.PluginID, req.AuthTokens); err != nil {
+		writeErrorAuth(w, err)
 		return
 	}
 	q := `DELETE FROM trainings WHERE pluginid=$1 AND sentence=$2`
@@ -739,18 +799,7 @@ func handlerAPIUserProfile(w http.ResponseWriter, r *http.Request) {
 		writeErrorInternal(w, err)
 		return
 	}
-	var plugins []struct {
-		ID            uint64
-		Name          sql.NullString
-		Path          string
-		Description   sql.NullString
-		DownloadCount uint64
-		CompileOK     bool
-		VetOK         bool
-		TestOK        bool
-		Error         sql.NullString
-		UpdatedAt     time.Time
-	}
+	var plugins []Plugin
 	q := `SELECT id, name, path, description, downloadcount, compileok,
 		vetok, testok, error, updatedat
 	      FROM plugins WHERE userid=$1`
@@ -758,7 +807,18 @@ func handlerAPIUserProfile(w http.ResponseWriter, r *http.Request) {
 		writeErrorInternal(w, err)
 		return
 	}
-	byt, err := json.Marshal(plugins)
+	var tokens []Token
+	q = `SELECT token, createdat FROM authtokens WHERE userid=$1
+	     ORDER BY createdat DESC`
+	if err = db.Select(&tokens, q, cookie.Value); err != nil {
+		writeErrorInternal(w, err)
+		return
+	}
+	resp := struct {
+		Plugins []Plugin
+		Tokens  []Token
+	}{Plugins: plugins, Tokens: tokens}
+	byt, err := json.Marshal(resp)
 	if err != nil {
 		writeErrorInternal(w, err)
 		return
@@ -842,6 +902,97 @@ func handlerAPIUserLoginSubmit(w http.ResponseWriter, r *http.Request) {
 	if _, err = w.Write(byt); err != nil {
 		log.Info("failed to write resp to http.ResponseWriter", err)
 	}
+}
+
+// handlerAPIAuthTokens returns all the auth tokens for a given user.
+func handlerAPIAuthTokens(w http.ResponseWriter, r *http.Request) {
+	if os.Getenv("ITSABOT_ENV") != "test" {
+		if !loggedIn(w, r) {
+			return
+		}
+	}
+	cookie, err := r.Cookie("id")
+	if err != nil {
+		writeErrorInternal(w, err)
+		return
+	}
+	var tokens []string
+	q := `SELECT token FROM authtokens WHERE userid=$1
+	      ORDER BY createdat DESC`
+	if err = db.Get(&tokens, q, cookie.Value); err != nil {
+		writeErrorInternal(w, err)
+		return
+	}
+	byt, err := json.Marshal(&tokens)
+	if err != nil {
+		writeErrorInternal(w, err)
+		return
+	}
+	_, err = w.Write(byt)
+	if err != nil {
+		log.Info("failed to write response.", err)
+	}
+}
+
+// handlerAPIAuthTokenGenerate an auth token for authenticating into external
+// services.
+func handlerAPIAuthTokenGenerate(w http.ResponseWriter, r *http.Request) {
+	if os.Getenv("ITSABOT_ENV") != "test" {
+		if !loggedIn(w, r) {
+			return
+		}
+	}
+	token, err := generateToken(48)
+	if err != nil {
+		writeErrorInternal(w, err)
+		return
+	}
+	cookie, err := r.Cookie("id")
+	if err != nil {
+		writeErrorInternal(w, err)
+		return
+	}
+	var t time.Time
+	q := `INSERT INTO authtokens (token, userid) VALUES ($1, $2)
+	      RETURNING createdat`
+	if err = db.QueryRow(q, token, cookie.Value).Scan(&t); err != nil {
+		writeErrorInternal(w, err)
+		return
+	}
+	res := struct {
+		Token     string
+		CreatedAt time.Time
+	}{Token: token, CreatedAt: t}
+	byt, err := json.Marshal(res)
+	if err != nil {
+		writeErrorInternal(w, err)
+		return
+	}
+	_, err = w.Write(byt)
+	if err != nil {
+		log.Info("failed to write response.", err)
+	}
+}
+
+// handlerAPIAuthTokenDelete deletes an auth token from the DB.
+func handlerAPIAuthTokenDelete(w http.ResponseWriter, r *http.Request) {
+	if os.Getenv("ITSABOT_ENV") != "test" {
+		if !loggedIn(w, r) {
+			return
+		}
+	}
+	var req struct{ Token string }
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErrorBadRequest(w, err)
+		return
+	}
+	q := `DELETE FROM authtokens WHERE token=$1`
+	_, err := db.Exec(q, req.Token)
+	if err != nil {
+		writeErrorInternal(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 // handlerAPIUserCreate creates a new user and a first access token.
@@ -966,24 +1117,26 @@ func connectDB() (*sqlx.DB, error) {
 	return db, nil
 }
 
-// This is based on a StackOverflow answer here:
-// http://stackoverflow.com/a/31832326
-func generateToken(n int) string {
+// generateTokenBytes is taken from the following URL (May 4, 2016), and
+// licensed by its author under MIT.
+//
+// https://elithrar.github.io/article/generating-secure-random-numbers-crypto-rand/
+func generateTokenBytes(n uint) ([]byte, error) {
 	b := make([]byte, n)
-	// A rand.Int63() generates 63 random bits, enough for letterIdxMax
-	// characters
-	for i, cache, remain := n-1, rand.Int63(), letterIdxMax; i >= 0; {
-		if remain == 0 {
-			cache, remain = rand.Int63(), letterIdxMax
-		}
-		if idx := int(cache & letterIdxMask); idx < len(letterBytes) {
-			b[i] = letterBytes[idx]
-			i--
-		}
-		cache >>= letterIdxBits
-		remain--
+	_, err := rand.Read(b)
+	if err != nil {
+		return nil, err
 	}
-	return string(b)
+	return b, nil
+}
+
+// generateToken is taken from the following URL (May 4, 2016), and licensed by
+// its author under MIT.
+//
+// https://elithrar.github.io/article/generating-secure-random-numbers-crypto-rand/
+func generateToken(n uint) (string, error) {
+	b, err := generateTokenBytes(n)
+	return base64.URLEncoding.EncodeToString(b), err
 }
 
 func writeErr(w http.ResponseWriter, msg string) {
@@ -1036,6 +1189,27 @@ func csrf(w http.ResponseWriter, r *http.Request) bool {
 	}
 	log.Debug("validated csrf")
 	return true
+}
+
+// authToken ensures that a remote Abot has access to perform whichever
+// function follows by ensuring the auth tokens passed in match the plugins to
+// be modified. This function returns the verified plugin ID authorized to be
+// modified. If the plugin could not be verified, the returned bool is false.
+func authToken(w http.ResponseWriter, r *http.Request) (uint64, bool) {
+	tmp := w.Header().Get("X-Auth-Tokens")
+	tokens := strings.Split(tmp, ",")
+
+	// db.Get throws an error when no rows are found, thus we don't need to
+	// check the count. If there's no error, count must be greater than 0.
+	var count int
+	var args []interface{}
+	q = `SELECT COUNT(*) FROM authtokens WHERE userid=$1 AND token IN (?)`
+	q, args, err = sqlx.In(q, ts)
+	q = db.Rebind(q)
+	if err := db.Get(&count, q, uid, args); err != nil {
+		writeErrorAuth(w, err)
+		return 0, false
+	}
 }
 
 // loggedIn determines if the user is currently logged in.
@@ -1156,7 +1330,10 @@ func loggedIn(w http.ResponseWriter, r *http.Request) bool {
 func createCSRFToken(uid uint64) (token string, err error) {
 	q := `INSERT INTO csrfs (token, userid)
 	      VALUES ($1, $2)`
-	token = generateToken(securityTokenLength)
+	token, err = generateToken(securityTokenLength)
+	if err != nil {
+		return "", err
+	}
 	if _, err := db.Exec(q, token, uid); err != nil {
 		return "", err
 	}
@@ -1186,6 +1363,19 @@ func getAuthToken(uid uint64, email string) (header *Header, authToken string,
 	}
 	authToken = base64.StdEncoding.EncodeToString(hash.Sum(nil))
 	return header, authToken, nil
+}
+
+// validateTokens ensures that one of the tokens passed in matches a plugin
+// publisher's tokens. It returns an error if anything goes wrong or if the
+// tokens don't match.
+func validateTokens(pid uint64, ts []string) error {
+	var uid uint64
+	q := `SELECT userid FROM plugins WHERE id=$1`
+	if err := db.Get(&uid, q, pid); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func writeErrorBadRequest(w http.ResponseWriter, err error) {
