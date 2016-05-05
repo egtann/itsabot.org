@@ -11,8 +11,8 @@ abot.isProduction = function() {
 }
 abot.request = function(opts) {
 	opts.config = function(xhr) {
-		xhr.setRequestHeader("Authorization", "Bearer " + cookie.getItem("authToken"))
-		xhr.setRequestHeader("X-CSRF-Token", cookie.getItem("csrfToken"))
+		xhr.setRequestHeader("Authorization", "Bearer " + cookie.getItem("iaAuthToken"))
+		xhr.setRequestHeader("X-CSRF-Token", cookie.getItem("iaCSRFToken"))
 	}
 	return m.request(opts)
 }
@@ -32,19 +32,18 @@ abot.prettyTime = function(time) {
 }
 abot.signout = function(ev) {
 	ev.preventDefault()
+	cookie.removeItem("iaID")
+	cookie.removeItem("iaEmail")
+	cookie.removeItem("iaIssuedAt")
+	cookie.removeItem("iaScopes")
+	cookie.removeItem("iaCSRFToken")
+	cookie.removeItem("iaAuthToken")
 	abot.request({
 		url: "/api/users.json",
 		method: "DELETE",
 	}).then(function() {
-		cookie.removeItem("id")
-		cookie.removeItem("email")
-		cookie.removeItem("issuedAt")
-		cookie.removeItem("scopes")
-		cookie.removeItem("csrfToken")
-		cookie.removeItem("authToken")
-		m.route("/login")
+		m.route("/login", null, true)
 	}, function(err) {
-		console.log(err)
 		console.error(err)
 	})
 }

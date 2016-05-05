@@ -8,7 +8,8 @@ abot.SearchResult.controller = function(pctrl) {
 			url: "/api/plugins.json",
 			data: { PluginID: id },
 		}).then(function() {
-			m.route("/profile")
+			// TODO improve this using m.prop
+			m.route("/profile", null, true)
 		}, function(err) {
 			console.error(err)
 		})

@@ -706,6 +706,36 @@ body {
 	color: black;
 	text-decoration: none;
 }
+.search-results {
+	padding: 0; 
+	list-style-type: none;
+}
+.search-results li {
+	color: gray;
+}
+.search-results li a {
+	margin-right: 1em;
+	text-decoration: none;
+}
+.search-results li table {
+	width: 100%;
+}
+.search-results li table tr {
+	display: block;
+	border-bottom: 1px solid #ccc;
+	padding: 1.5em;
+	margin-left: -1.5em;
+}
+.search-results li table tr td {
+	width: 100%;
+}
+.search-results .downloads {
+	text-align: right;
+}
+.search-results .description {
+	margin-top: 0.5em;
+	color: black;
+}
 .searchbar {
 	padding: 1em 0;
 	background-color: #d8d8d8;
@@ -740,36 +770,6 @@ body {
 	.searchbar .main input {
 		width: 70%;
 	}
-}
-.search-results {
-	padding: 0; 
-	list-style-type: none;
-}
-.search-results li {
-	color: gray;
-}
-.search-results li a {
-	margin-right: 1em;
-	text-decoration: none;
-}
-.search-results li table {
-	width: 100%;
-}
-.search-results li table tr {
-	display: block;
-	border-bottom: 1px solid #ccc;
-	padding: 1.5em;
-	margin-left: -1.5em;
-}
-.search-results li table tr td {
-	width: 100%;
-}
-.search-results .downloads {
-	text-align: right;
-}
-.search-results .description {
-	margin-top: 0.5em;
-	color: black;
 }
 table {
 	width: 100%;

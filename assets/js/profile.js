@@ -65,7 +65,7 @@ abot.Profile.view = function(ctrl) {
 		m.component(abot.Header),
 		m(".main", [
 			m(".content", [
-				m("h1", "Profile - " + cookie.getItem("email")),
+				m("h1", "Profile - " + cookie.getItem("iaEmail")),
 				function() {
 					if (ctrl.props.error().length > 0) {
 						return m("#err.alert.alert-error", ctrl.props.error())

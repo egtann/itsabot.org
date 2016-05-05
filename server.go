@@ -94,6 +94,7 @@ func main() {
 	router.HandlerFunc("DELETE", "/api/users/auth_token.json", handlerAPIAuthTokenDelete)
 
 	// Plugin routes
+	router.Handle("GET", "/api/plugins/by_name/:name", handlerAPIPluginsByName)
 	router.Handle("GET", "/api/plugins/search/:q", handlerAPIPluginsSearch)
 	router.HandlerFunc("GET", "/api/plugins/popular.json", handlerAPIPluginsPopular)
 	router.HandlerFunc("POST", "/api/plugins.json", handlerAPIPluginsCreate)
@@ -106,8 +107,10 @@ func main() {
 	router.HandlerFunc("POST", "/api/plugins/train.json", handlerAPIPluginsTrain)
 	router.HandlerFunc("PUT", "/api/plugins/train.json", handlerAPIPluginsTrainUpdate)
 	router.HandlerFunc("DELETE", "/api/plugins/train.json", handlerAPIPluginsTrainDelete)
+	router.Handle("POST", "/api/plugins/test_auth.json", handlerAPIPluginsTestAuth)
 	router.HandlerFunc("OPTIONS", "/api/plugins/train/:pluginName", handlerAPIOptionsTrainings)
 	router.HandlerFunc("OPTIONS", "/api/plugins/train.json", handlerAPIOptionsTrain)
+	router.HandlerFunc("OPTIONS", "/api/plugins/test_auth.json", handlerAPIOptionsTrain)
 
 	// Create a worker pool to process and test plugins
 	pool, err = tunny.CreatePool(runtime.NumCPU(), func(object interface{}) interface{} {
@@ -309,7 +312,7 @@ func handlerAPIOptionsTrainings(w http.ResponseWriter, r *http.Request) {
 func handlerAPIOptionsTrain(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Methods", "POST,PUT,DELETE")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Access-Control-Allow-Origin")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Access-Control-Allow-Origin,X-Auth-Tokens,X-Auth-Plugin-ID")
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -364,6 +367,31 @@ func handlerAPIPluginsPopular(w http.ResponseWriter, r *http.Request) {
 	if _, err = w.Write(byt); err != nil {
 		log.Info("failed to write bytes", err)
 		return
+	}
+}
+
+// handlerAPIPluginsByName enables an Abot to receive plugin IDs for installed
+// plugins. Handling this on plugin install enables Abot to communicate with
+// plugin IDs in all requests that follow, which dramatically improves DB
+// performance.
+func handlerAPIPluginsByName(w http.ResponseWriter, r *http.Request,
+	ps httprouter.Params) {
+
+	plugin := ps.ByName("name")
+	var resp struct{ ID uint64 }
+	q := `SELECT id FROM plugins WHERE name=$1`
+	if err := db.Get(&resp, q, plugin); err != nil {
+		writeErrorInternal(w, err)
+		return
+	}
+	byt, err := json.Marshal(resp)
+	if err != nil {
+		writeErrorInternal(w, err)
+		return
+	}
+	_, err = w.Write(byt)
+	if err != nil {
+		log.Info("failed to write response.", err)
 	}
 }
 
@@ -449,7 +477,7 @@ func handlerAPIPluginsCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get userID
-	cookie, err := r.Cookie("id")
+	cookie, err := r.Cookie("iaID")
 	if err == http.ErrNoCookie {
 		writeErrorInternal(w, err)
 		return
@@ -500,7 +528,7 @@ func handlerAPIPluginsDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get userID
-	cookie, err := r.Cookie("id")
+	cookie, err := r.Cookie("iaID")
 	if err == http.ErrNoCookie {
 		writeErrorInternal(w, err)
 		return
@@ -587,11 +615,15 @@ func handlerAPIPluginsTrainings(w http.ResponseWriter, r *http.Request, ps httpr
 // handlerAPIPluginsTrain trains a plugin on a new sentence or updates the
 // intent of an existing sentence.
 func handlerAPIPluginsTrain(w http.ResponseWriter, r *http.Request) {
+	var pid uint64
 	if os.Getenv("ABOT_ENV") != "test" {
-		if !authToken(w, r) {
+		var ok bool
+		pid, ok = authToken(w, r)
+		if !ok {
 			return
 		}
 	}
+	log.Info("received pid", pid)
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Access-Control-Allow-Origin")
 	var req struct {
@@ -680,17 +712,13 @@ func handlerAPIPluginsTrainUpdate(w http.ResponseWriter, r *http.Request) {
 		writeErrorBadRequest(w, err)
 		return
 	}
-	if err := validateTokens(req.PluginID, req.AuthTokens); err != nil {
-		writeErrorAuth(w, err)
-		return
-	}
 	tx, err := db.Beginx()
 	if err != nil {
 		writeErrorInternal(w, err)
 		return
 	}
 	var q string
-	for _, s := range req.Sentences {
+	for _, s := range req {
 		q = `UPDATE trainings SET intent=$1 WHERE id=$2`
 		_, err = tx.Exec(q, s.Intent, s.ID)
 		if err != nil {
@@ -731,9 +759,55 @@ func handlerAPIPluginsTrainDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// handlerAPIPluginsTestAuth is a helper for testing remote Abot authentication
+// when adding tokens. This handler returns the associated plugin ID for which
+// training may be performed.
+func handlerAPIPluginsTestAuth(w http.ResponseWriter, r *http.Request,
+	ps httprouter.Params) {
+
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Access-Control-Allow-Origin")
+	var req struct{ Token string }
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErrorBadRequest(w, err)
+		return
+	}
+	var uid uint64
+	q := `SELECT userid FROM authtokens WHERE token=$1`
+	err := db.Get(&uid, q, req.Token)
+	if err == sql.ErrNoRows {
+		writeErrorBadRequest(w, errors.New("Invalid token. Are you sure you copied it correctly?"))
+		return
+	}
+	if err != nil {
+		writeErrorInternal(w, err)
+		return
+	}
+	var resp struct {
+		ID   uint64
+		Name string
+	}
+	q = `SELECT id, name FROM plugins WHERE userid=$1`
+	if err = db.Get(&resp, q, uid); err != nil {
+		writeErrorInternal(w, err)
+		return
+	}
+	byt, err := json.Marshal(resp)
+	if err != nil {
+		writeErrorInternal(w, err)
+		return
+	}
+	_, err = w.Write(byt)
+	if err != nil {
+		log.Info("failed to write response.", err)
+	}
+}
+
 // handlerAPIWeatherSearch handles basic weather searching without requiring an
 // API key for demo purposes.
-func handlerAPIWeatherSearch(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+func handlerAPIWeatherSearch(w http.ResponseWriter, r *http.Request,
+	ps httprouter.Params) {
+
 	city := ps.ByName("city")
 	if len(city) == 0 {
 		writeErrorBadRequest(w, errors.New("city param must be included"))
@@ -794,7 +868,7 @@ func handlerAPIUserProfile(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	cookie, err := r.Cookie("id")
+	cookie, err := r.Cookie("iaID")
 	if err != nil {
 		writeErrorInternal(w, err)
 		return
@@ -911,7 +985,7 @@ func handlerAPIAuthTokens(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	cookie, err := r.Cookie("id")
+	cookie, err := r.Cookie("iaID")
 	if err != nil {
 		writeErrorInternal(w, err)
 		return
@@ -947,7 +1021,7 @@ func handlerAPIAuthTokenGenerate(w http.ResponseWriter, r *http.Request) {
 		writeErrorInternal(w, err)
 		return
 	}
-	cookie, err := r.Cookie("id")
+	cookie, err := r.Cookie("iaID")
 	if err != nil {
 		writeErrorInternal(w, err)
 		return
@@ -955,7 +1029,8 @@ func handlerAPIAuthTokenGenerate(w http.ResponseWriter, r *http.Request) {
 	var t time.Time
 	q := `INSERT INTO authtokens (token, userid) VALUES ($1, $2)
 	      RETURNING createdat`
-	if err = db.QueryRow(q, token, cookie.Value).Scan(&t); err != nil {
+	err = db.QueryRow(q, token, cookie.Value).Scan(&t)
+	if err != nil {
 		writeErrorInternal(w, err)
 		return
 	}
@@ -1068,7 +1143,7 @@ func handlerAPIUserExpireTokens(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	cookie, err := r.Cookie("id")
+	cookie, err := r.Cookie("iaID")
 	if err != nil {
 		writeErrorInternal(w, err)
 		return
@@ -1156,7 +1231,7 @@ func csrf(w http.ResponseWriter, r *http.Request) bool {
 	log.Debug("validating csrf")
 	var userID uint64
 	q := `SELECT userid FROM csrfs WHERE userid=$1 AND token=$2`
-	cookie, err := r.Cookie("id")
+	cookie, err := r.Cookie("iaID")
 	if err == http.ErrNoCookie {
 		writeErrorAuth(w, err)
 		return false
@@ -1166,7 +1241,7 @@ func csrf(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 	uid := cookie.Value
-	cookie, err = r.Cookie("csrfToken")
+	cookie, err = r.Cookie("iaCSRFToken")
 	if err == http.ErrNoCookie {
 		writeErrorAuth(w, err)
 		return false
@@ -1198,18 +1273,31 @@ func csrf(w http.ResponseWriter, r *http.Request) bool {
 func authToken(w http.ResponseWriter, r *http.Request) (uint64, bool) {
 	tmp := w.Header().Get("X-Auth-Tokens")
 	tokens := strings.Split(tmp, ",")
+	tmp2 := w.Header().Get("X-Auth-Plugin-ID")
+	pluginID, err := strconv.ParseUint(tmp2, 10, 64)
+	if err != nil {
+		writeErrorAuth(w, err)
+		return 0, false
+	}
 
 	// db.Get throws an error when no rows are found, thus we don't need to
 	// check the count. If there's no error, count must be greater than 0.
+	var uid uint64
 	var count int
 	var args []interface{}
+	q := `SELECT userid FROM plugins WHERE id=$1`
+	if err := db.Get(&uid, q, pluginID); err != nil {
+		writeErrorAuth(w, err)
+		return 0, false
+	}
 	q = `SELECT COUNT(*) FROM authtokens WHERE userid=$1 AND token IN (?)`
-	q, args, err = sqlx.In(q, ts)
+	q, args, err = sqlx.In(q, tokens)
 	q = db.Rebind(q)
 	if err := db.Get(&count, q, uid, args); err != nil {
 		writeErrorAuth(w, err)
 		return 0, false
 	}
+	return pluginID, true
 }
 
 // loggedIn determines if the user is currently logged in.
@@ -1228,7 +1316,7 @@ func loggedIn(w http.ResponseWriter, r *http.Request) bool {
 	}
 
 	// Ensure the token is still valid
-	cookie, err := r.Cookie("issuedAt")
+	cookie, err := r.Cookie("iaIssuedAt")
 	if err == http.ErrNoCookie {
 		writeErrorAuth(w, err)
 		return false
@@ -1261,7 +1349,7 @@ func loggedIn(w http.ResponseWriter, r *http.Request) bool {
 		writeErrorInternal(w, err)
 		return false
 	}
-	cookie, err = r.Cookie("scopes")
+	cookie, err = r.Cookie("iaScopes")
 	if err == http.ErrNoCookie {
 		writeErrorAuth(w, err)
 		return false
@@ -1271,7 +1359,7 @@ func loggedIn(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 	scopes := strings.Fields(cookie.Value)
-	cookie, err = r.Cookie("id")
+	cookie, err = r.Cookie("iaID")
 	if err == http.ErrNoCookie {
 		writeErrorAuth(w, err)
 		return false
@@ -1285,7 +1373,7 @@ func loggedIn(w http.ResponseWriter, r *http.Request) bool {
 		writeErrorInternal(w, err)
 		return false
 	}
-	cookie, err = r.Cookie("email")
+	cookie, err = r.Cookie("iaEmail")
 	if err == http.ErrNoCookie {
 		writeErrorAuth(w, err)
 		return false
